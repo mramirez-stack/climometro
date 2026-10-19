@@ -5365,15 +5365,37 @@ try {
       id: 'hurr-points-label', type: 'symbol', source: 'hurr-points',
       layout: {
         visibility: 'none',
-        'text-field': ['case', ['==', ['get','tau'], 0],
-          ['get','stormname'],
-          ['get','datelbl']
+        // Categoría fija en cada punto (pedido de PepsiCo, 19-oct): «H1»…«H5» por
+        // ssnum (Saffir-Simpson), «TT» tormenta (sub)tropical, «DT» depresión
+        // (sub)tropical, «PT» post-tropical — los mismos campos que ya usa el
+        // tooltip. En tau=0 va junto al nombre; en los demás puntos, antes del
+        // día/hora. Sin categoría conocida, la etiqueta queda como antes.
+        'text-field': ['let', 'cat',
+          ['case',
+            ['>=', ['coalesce', ['get','ssnum'], 0], 1],
+              ['concat', 'H', ['to-string', ['to-number', ['get','ssnum']]]],
+            ['in', ['coalesce', ['get','stormtype'], ''], ['literal', ['TS','STS']]], 'TT',
+            ['in', ['coalesce', ['get','stormtype'], ''], ['literal', ['TD','STD']]], 'DT',
+            ['==', ['coalesce', ['get','stormtype'], ''], 'PTC'], 'PT',
+            ''
+          ],
+          ['case', ['==', ['get','tau'], 0],
+            ['concat', ['coalesce', ['get','stormname'], ''],
+              ['case', ['==', ['var','cat'], ''], '', ['concat', ' · ', ['var','cat']]]],
+            ['concat', ['var','cat'],
+              ['case', ['==', ['var','cat'], ''], '', ' · '],
+              ['coalesce', ['get','datelbl'], '']]
+          ]
         ],
         'text-font': ['Open Sans Semibold', 'Arial Unicode MS Bold'],
-        'text-size': ['case', ['==', ['get','tau'], 0], 12, 9],
-        'text-offset': [0, 1.3],
-        'text-anchor': 'top',
-        'text-allow-overlap': false
+        'text-size': ['case', ['==', ['get','tau'], 0], 12, 10],
+        // El nombre (tau=0) va ARRIBA del punto y las horas abajo: así el nombre
+        // no se encima con la etiqueta del siguiente punto de la trayectoria.
+        'text-offset': ['case', ['==', ['get','tau'], 0], ['literal', [0, -1.3]], ['literal', [0, 1.3]]],
+        'text-anchor': ['case', ['==', ['get','tau'], 0], 'bottom', 'top'],
+        // Fija de verdad: Mapbox oculta las etiquetas que chocan; con overlap la
+        // categoría se ve en todos los puntos aunque en zoom bajo se encimen.
+        'text-allow-overlap': true
       },
       paint: {
         'text-color': '#c81f10',
