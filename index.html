@@ -1000,12 +1000,14 @@ canvas.wind-raster{
               Tus instalaciones con semáforo propio a 7 días, exposición histórica y alerta de ciclón.
               <b style="color:var(--aleph-yellow)">Se guardan solo en este navegador</b>: se pierden al limpiar datos del sitio
               o al cambiar de equipo. Respalda el archivo para no volver a capturarlas.
+              Para cargar muchas de golpe, sube un CSV o Excel guardado como CSV con columnas
+              <b>nombre, lat, lng</b> (hasta 200 sitios).
             </div>
             <button id="site-add" class="site-add-btn" type="button">+ Agregar sitio (clic en el mapa)</button>
             <div id="sites-io" style="display:flex;gap:6px;margin-top:6px">
               <button id="sites-export" class="cl-toggle" type="button" style="flex:1;padding:6px;font-size:11px">↓ Respaldar</button>
-              <button id="sites-import" class="cl-toggle" type="button" style="flex:1;padding:6px;font-size:11px">↑ Restaurar</button>
-              <input id="sites-file" type="file" accept="application/json,.json" style="display:none">
+              <button id="sites-import" class="cl-toggle" type="button" style="flex:1;padding:6px;font-size:11px">↑ Cargar (JSON o CSV)</button>
+              <input id="sites-file" type="file" accept="application/json,.json,text/csv,.csv,.txt" style="display:none">
             </div>
             <div id="sites-io-msg" style="font-size:10.5px;color:var(--text-dim);margin-top:6px;line-height:1.4"></div>
           </div>
@@ -2592,6 +2594,38 @@ function refreshHistLayers(){
 // dentro del cono de un ciclón activo.
 // ════════════════════════════════════════════════════════════════════════
 const SITES_KEY = 'climometro_sitios_v1';
+const SITES_MAX = 200;
+// CSV de sitios → [{name, lat, lng}]. Tolera BOM, separador , ; o tabulador,
+// encabezados en español o inglés (nombre/name/sitio, lat/latitud, lng/lon/long/longitud),
+// comillas y coma decimal cuando el separador es ; o tabulador. Devuelve null si no
+// reconoce las columnas.
+function parseSitiosCSV(texto){
+  const lineas = String(texto || '').replace(/^\uFEFF/, '').split(/\r?\n/).filter(l => l.trim());
+  if(lineas.length < 2) return null;
+  const sep = [';', '\t', ','].reduce((best, s) => (lineas[0].split(s).length > lineas[0].split(best).length ? s : best), ',');
+  const partir = l => {
+    const out = []; let cur = '', q = false;
+    for(const ch of l){
+      if(ch === '"'){ q = !q; continue; }
+      if(ch === sep && !q){ out.push(cur); cur = ''; continue; }
+      cur += ch;
+    }
+    out.push(cur);
+    return out.map(s => s.trim());
+  };
+  const norm = s => s.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+  const cab = partir(lineas[0]).map(norm);
+  const idx = (names) => cab.findIndex(c => names.includes(c));
+  const iName = idx(['nombre', 'name', 'sitio', 'site', 'instalacion', 'planta', 'cedis']);
+  const iLat = idx(['lat', 'latitud', 'latitude', 'y']);
+  const iLng = idx(['lng', 'lon', 'long', 'longitud', 'longitude', 'x']);
+  if(iLat < 0 || iLng < 0) return null;
+  const num = s => Number(String(s).replace(/\s/g, '').replace(sep === ',' ? /$^/ : ',', '.'));
+  return lineas.slice(1).map((l, i) => {
+    const c = partir(l);
+    return { name: iName >= 0 && c[iName] ? c[iName] : 'Sitio ' + (i + 1), lat: num(c[iLat]), lng: num(c[iLng]) };
+  });
+}
 let sites = [];
 try { sites = JSON.parse(localStorage.getItem(SITES_KEY) || '[]'); } catch(e){ sites = []; }
 let siteWeather = null, siteWeatherFor = '';
@@ -3810,11 +3844,17 @@ if(sitiosImportBtn && sitiosFile){
     const f = sitiosFile.files && sitiosFile.files[0];
     sitiosFile.value = '';
     if(!f) return;
-    let datos;
-    try { datos = JSON.parse(await f.text()); }
-    catch(e){ sitiosIOMsg('Ese archivo no es un respaldo válido.', 'var(--red-text)'); return; }
+    // Acepta el respaldo JSON del propio portal o un CSV (Excel «guardar como CSV»):
+    // columnas nombre / lat / lng, en cualquier orden, con , o ; como separador.
+    const texto = await f.text();
+    let datos = null, esCSV = false;
+    try { datos = JSON.parse(texto); }
+    catch(e){ datos = parseSitiosCSV(texto); esCSV = true; }
     const lista = Array.isArray(datos) ? datos : (datos && datos.sitios);
-    if(!Array.isArray(lista)){ sitiosIOMsg('Ese archivo no es un respaldo del Climómetro.', 'var(--red-text)'); return; }
+    if(!Array.isArray(lista)){
+      sitiosIOMsg(esCSV ? 'No encontré columnas nombre, lat y lng en el CSV.' : 'Ese archivo no es un respaldo del Climómetro.', 'var(--red-text)');
+      return;
+    }
     // Validar cada sitio: un archivo editado a mano no debe meter basura al
     // mapa ni coordenadas fuera del planeta.
     const limpios = lista.map(x => ({
@@ -3822,12 +3862,20 @@ if(sitiosImportBtn && sitiosFile){
       lat: Number(x && x.lat), lng: Number(x && x.lng)
     })).filter(x => x.name && isFinite(x.lat) && isFinite(x.lng)
       && x.lat >= -90 && x.lat <= 90 && x.lng >= -180 && x.lng <= 180);
-    if(!limpios.length){ sitiosIOMsg('El respaldo no trae sitios utilizables.', 'var(--red-text)'); return; }
+    if(!limpios.length){ sitiosIOMsg('El archivo no trae sitios utilizables.', 'var(--red-text)'); return; }
+    // El proxy del pronóstico solo atiende México y su entorno (5–35° N, 125–80° O) y
+    // rechaza la tanda completa si un solo punto cae fuera: esos se omiten aquí.
+    const enZona = limpios.filter(x => x.lat >= 5 && x.lat <= 35 && x.lng >= -125 && x.lng <= -80);
+    const fuera = limpios.length - enZona.length;
+    if(!enZona.length){ sitiosIOMsg('Ningún sitio está dentro de México o su entorno; no hay pronóstico para ellos.', 'var(--red-text)'); return; }
     // Fusionar, no reemplazar: restaurar no debe borrar lo que ya se capturó.
     const clave = x => x.name.toLowerCase() + '|' + x.lat.toFixed(4) + '|' + x.lng.toFixed(4);
     const vistos = new Set(sites.map(clave));
-    const nuevos = limpios.filter(x => !vistos.has(clave(x)));
-    const tope = Math.max(0, 30 - sites.length);
+    // Un mismo sitio repetido dentro del archivo entra una sola vez.
+    const nuevos = enZona.filter(x => { const k = clave(x); if(vistos.has(k)) return false; vistos.add(k); return true; });
+    // Tope de 200 sitios por navegador: el proxy acepta hasta 300 puntos por llamada
+    // y los sitios viajan todos en una sola (loadSiteWeather).
+    const tope = Math.max(0, SITES_MAX - sites.length);
     const agregados = nuevos.slice(0, tope);
     sites = sites.concat(agregados);
     saveSites();
@@ -3837,10 +3885,11 @@ if(sitiosImportBtn && sitiosFile){
     ensureHistData('histflood').then(() => renderSitesPanel());
     ensureHistData('histtracks').then(() => renderSitesPanel());
     sitiosIOMsg(agregados.length
-      ? 'Restaurados ' + agregados.length + ' sitio' + (agregados.length>1?'s':'')
-        + (nuevos.length > agregados.length ? ' (tope de 30 alcanzado)' : '')
-        + (limpios.length > nuevos.length ? ' · ' + (limpios.length - nuevos.length) + ' ya estaban' : '')
-      : 'Todos los sitios del respaldo ya estaban cargados.',
+      ? 'Cargados ' + agregados.length + ' sitio' + (agregados.length>1?'s':'')
+        + (nuevos.length > agregados.length ? ' (tope de ' + SITES_MAX + ' alcanzado)' : '')
+        + (enZona.length > nuevos.length ? ' · ' + (enZona.length - nuevos.length) + ' ya estaban' : '')
+        + (fuera ? ' · ' + fuera + ' fuera de México, omitido' + (fuera>1?'s':'') : '')
+      : 'Todos los sitios del archivo ya estaban cargados.' + (fuera ? ' ' + fuera + ' fuera de México, omitido' + (fuera>1?'s':'') + '.' : ''),
       agregados.length ? '#7fdca4' : 'var(--text-dim)');
     track('sitios_restaurados', { n: agregados.length });
   });
