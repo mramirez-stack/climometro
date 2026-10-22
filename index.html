@@ -1182,6 +1182,8 @@ canvas.wind-raster{
           <div style="display:flex;gap:10px;flex-wrap:wrap;width:170px;">
             <span class="cl-wind-key" id="cl-key-geocerca"><i style="background:#ff9530"></i>&nbsp;Geocerca de afectación</span>
             <span class="cl-wind-key" id="cl-key-cyclone" style="display:none"><span style="color:#c81f10">◌</span>&nbsp;Cono ciclón (NHC)</span>
+            <span class="cl-wind-key" id="cl-key-ww" style="display:none"><span style="color:#c81f10">▬</span>&nbsp;Aviso / vigilancia costera (NHC)</span>
+            <span class="cl-wind-key" id="cl-key-outlook" style="display:none"><span style="color:#ff9530">◌</span>&nbsp;Posible formación a 7 días (NHC)</span>
             <span class="cl-wind-key" id="cl-key-quake" style="display:none"><span style="color:#7a4fd0">◉</span>&nbsp;Sismo M4.5+ 48 h</span>
           </div>
         </div>
@@ -1540,7 +1542,7 @@ let corridorWeatherInflight = null;
 let corridorRoutes = null;        // id → [[lng,lat],…] geometría real (OSRM/OSM, precomputada)
 let corridorClimaLevels = null;   // [ci][dayIdx] → nivel 0/1/2 a lo largo del corredor
 let corridorClimaStats = null;    // [ci][dayIdx] → {rain, gust} máximos del corredor
-let riskFeeds = { storms:null, quakes:null, floodReady:false, inflight:null };
+let riskFeeds = { storms:null, quakes:null, outlook:null, floodReady:false, inflight:null };
 // ── ESTADO DE LAS FUENTES ───────────────────────────────────────────────
 // Un producto de alertas tiene que distinguir "no hay alerta" de "no sé".
 // Aquí vive lo que sabemos de cada fuente; la UI lo muestra y el PDF lo sella.
@@ -2044,7 +2046,25 @@ const NHC_SLOTS = (() => {
   }
   return slots;
 })();
-const NHC_CACHE_KEY = 'climometro_nhc_v1';
+const NHC_CACHE_KEY = 'climometro_nhc_v2'; // v2: guarda también avisos costeros y áreas de formación
+// Tropical Weather Outlook del mismo MapServer: áreas de posible formación a 7 días
+// (polígonos, capa 3) y su posición actual (puntos, capa 2). Mismos campos en ambas:
+// basin, prob2day, risk2day, prob7day, risk7day.
+const NHC_OUTLOOK_LAYERS = { areas: 3, points: 2 };
+// Avisos costeros (watch/warning) del aviso VIGENTE. La capa «{BIN} Watch-Warning»
+// (id = cono + 1) puede conservar segmentos de un aviso anterior (19-oct: Trudy traía
+// 21A con el cono en 25), así que se descartan los que no coincidan con el número
+// del cono. Sin número en alguno de los dos lados, se conservan.
+function advisoryNumber(v){ const m = String(v == null ? '' : v).match(/\d+/); return m ? parseInt(m[0], 10) : null; }
+function wwFC(fc, coneAdvisory){
+  const want = advisoryNumber(coneAdvisory);
+  const feats = (fc && fc.features ? fc.features : []).filter(f => {
+    const n = advisoryNumber(f.properties && f.properties.advisnum);
+    return want == null || n == null || n === want;
+  });
+  return { type:'FeatureCollection', features: feats };
+}
+const EMPTY_FC = () => ({ type:'FeatureCollection', features: [] });
 const NHC_CACHE_MS = 30 * 60 * 1000; // los avisos del NHC salen cada 3–6 h
 function nhcQueryUrl(layerId){
   return NHC_BASE+'/'+layerId+'/query?where=1%3D1&outFields=*&f=geojson';
@@ -2054,21 +2074,31 @@ async function loadHurricanes(){
     const raw = sessionStorage.getItem(NHC_CACHE_KEY);
     if(raw){
       const obj = JSON.parse(raw);
-      if(Date.now() - obj.at < NHC_CACHE_MS) return obj.storms;
+      if(Date.now() - obj.at < NHC_CACHE_MS){ riskFeeds.outlook = obj.outlook || null; return obj.storms; }
     }
   } catch(e){ /* ignore */ }
-  // Paso 1: sondear los 10 conos en paralelo (los slots vacíos regresan FC vacía).
-  const coneResults = await Promise.all(NHC_SLOTS.map(s =>
-    fetch(nhcQueryUrl(s.cone)).then(r => r.json()).then(fc => ({ slot:s, fc }))
-      .catch(() => ({ slot:s, fc:null }))
-  ));
+  // Paso 1: sondear los 10 conos en paralelo (los slots vacíos regresan FC vacía),
+  // y a la vez el outlook (áreas de formación y su posición actual).
+  const [coneResults, outlookAreas, outlookPoints] = await Promise.all([
+    Promise.all(NHC_SLOTS.map(s =>
+      fetch(nhcQueryUrl(s.cone)).then(r => r.json()).then(fc => ({ slot:s, fc }))
+        .catch(() => ({ slot:s, fc:null }))
+    )),
+    fetch(nhcQueryUrl(NHC_OUTLOOK_LAYERS.areas)).then(r => r.json()).catch(() => null),
+    fetch(nhcQueryUrl(NHC_OUTLOOK_LAYERS.points)).then(r => r.json()).catch(() => null)
+  ]);
+  riskFeeds.outlook = {
+    areas:  outlookAreas  && outlookAreas.features  ? outlookAreas  : EMPTY_FC(),
+    points: outlookPoints && outlookPoints.features ? outlookPoints : EMPTY_FC()
+  };
   const active = coneResults.filter(x => x.fc && x.fc.features && x.fc.features.length > 0);
-  // Paso 2: track + points solo para slots con tormenta.
+  // Paso 2: track + points + avisos costeros solo para slots con tormenta.
   const storms = [];
   await Promise.all(active.map(async ({ slot, fc }) => {
-    const [trackFc, pointsFc] = await Promise.all([
+    const [trackFc, pointsFc, wwFc] = await Promise.all([
       fetch(nhcQueryUrl(slot.track)).then(r => r.json()).catch(() => null),
-      fetch(nhcQueryUrl(slot.points)).then(r => r.json()).catch(() => null)
+      fetch(nhcQueryUrl(slot.points)).then(r => r.json()).catch(() => null),
+      fetch(nhcQueryUrl(slot.cone + 1)).then(r => r.json()).catch(() => null)
     ]);
     const props = fc.features[0].properties || {};
     const pts = (pointsFc && pointsFc.features) ? pointsFc.features : [];
@@ -2081,6 +2111,7 @@ async function loadHurricanes(){
       cone: fc,
       track: trackFc,
       points: pointsFc,
+      ww: wwFC(wwFc, props.advisnum),
       // Posición e intensidad actuales (maxwind viene en nudos)
       lat: now ? now.geometry.coordinates[1] : null,
       lng: now ? now.geometry.coordinates[0] : null,
@@ -2090,7 +2121,7 @@ async function loadHurricanes(){
       devLabel: now && now.properties ? now.properties.tcdvlp : ''
     });
   }));
-  try { sessionStorage.setItem(NHC_CACHE_KEY, JSON.stringify({ at: Date.now(), storms })); }
+  try { sessionStorage.setItem(NHC_CACHE_KEY, JSON.stringify({ at: Date.now(), storms, outlook: riskFeeds.outlook })); }
   catch(e){ /* quota — ignore */ }
   return storms;
 }
@@ -2426,6 +2457,10 @@ function hurricanesFC(kind){
     });
   });
   return { type:'FeatureCollection', features: feats };
+}
+function outlookFC(kind){
+  const o = riskFeeds.outlook;
+  return (o && o[kind] && o[kind].features) ? o[kind] : EMPTY_FC();
 }
 function quakesFC(){
   if(!riskFeeds.quakes || !riskFeeds.quakes.features) return { type:'FeatureCollection', features: [] };
@@ -2864,21 +2899,32 @@ function refreshRiskLayers(){
   // Leyenda: claves solo cuando la capa está encendida y hay datos reales.
   const hasStorms = !!(riskFeeds.storms && riskFeeds.storms.length);
   const hasQuakes = !!(riskFeeds.quakes && riskFeeds.quakes.features && riskFeeds.quakes.features.length);
+  const hasWW = !!(riskFeeds.storms && riskFeeds.storms.some(s => s.ww && s.ww.features && s.ww.features.length));
+  const hasOutlook = outlookFC('areas').features.length > 0;
   const cyKey = document.getElementById('cl-key-cyclone');
   if(cyKey) cyKey.style.display = (showCy && hasStorms) ? 'inline-flex' : 'none';
+  const wwKey = document.getElementById('cl-key-ww');
+  if(wwKey) wwKey.style.display = (showCy && hasWW) ? 'inline-flex' : 'none';
+  const olKey = document.getElementById('cl-key-outlook');
+  if(olKey) olKey.style.display = (showCy && hasOutlook) ? 'inline-flex' : 'none';
   const qkKey = document.getElementById('cl-key-quake');
   if(qkKey) qkKey.style.display = (showQk && hasQuakes) ? 'inline-flex' : 'none';
   const geoKey = document.getElementById('cl-key-geocerca');
   const hayGeo = mode === 'clima' && layerVis.geocercas && geocercasActivas().length > 0;
   if(geoKey) geoKey.style.display = hayGeo ? 'inline-flex' : 'none';
   const rowEl = document.getElementById('cl-risk-row');
-  if(rowEl) rowEl.style.display = ((showCy && hasStorms) || (showQk && hasQuakes) || hayGeo) ? 'flex' : 'none';
+  if(rowEl) rowEl.style.display = ((showCy && (hasStorms || hasOutlook)) || (showQk && hasQuakes) || hayGeo) ? 'flex' : 'none';
   if(!mapReady) return;
   const coneSrc = map.getSource('hurr-cone');   if(coneSrc)  coneSrc.setData(hurricanesFC('cone'));
   const trackSrc = map.getSource('hurr-track'); if(trackSrc) trackSrc.setData(hurricanesFC('track'));
   const ptsSrc = map.getSource('hurr-points');  if(ptsSrc)   ptsSrc.setData(hurricanesFC('points'));
+  const wwSrc = map.getSource('hurr-ww');       if(wwSrc)    wwSrc.setData(hurricanesFC('ww'));
+  const olSrc = map.getSource('hurr-outlook');   if(olSrc)    olSrc.setData(outlookFC('areas'));
+  const olpSrc = map.getSource('hurr-outlook-pts'); if(olpSrc) olpSrc.setData(outlookFC('points'));
   const qSrc = map.getSource('quakes');         if(qSrc)     qSrc.setData(quakesFC());
-  ['hurr-cone-fill','hurr-cone-line','hurr-track-line','hurr-points-circle','hurr-points-label'].forEach(id => setLayerVis(id, showCy));
+  ['hurr-cone-fill','hurr-cone-line','hurr-track-line','hurr-points-circle','hurr-points-label',
+   'hurr-ww-warning','hurr-ww-watch',
+   'hurr-outlook-fill','hurr-outlook-line','hurr-outlook-point','hurr-outlook-label'].forEach(id => setLayerVis(id, showCy));
   ['quakes-circle','quakes-label'].forEach(id => setLayerVis(id, showQk));
   refreshHistLayers();
 }
@@ -3360,7 +3406,7 @@ function processClimaZones(data){
 async function revalidateClima(manual){
   if(mode !== 'clima') return;
   if(manual){
-    riskFeeds = { storms:null, quakes:null, floodReady:false, inflight:null };
+    riskFeeds = { storms:null, quakes:null, outlook:null, floodReady:false, inflight:null };
     Object.keys(FUENTES).forEach(k => { FUENTES[k].ok = null; });
     gridWeatherData = null;
     loadRiskFeeds();
@@ -3600,6 +3646,20 @@ function buildClimaTickerItems(items){
       });
     });
   }
+  // ─── Áreas de posible formación (NHC outlook, 2 y 7 días) ──────────
+  outlookFC('areas').features.forEach(f => {
+    const p = f.properties || {};
+    const p7 = parseInt(String(p.prob7day || '').replace('%',''), 10) || 0;
+    if(p7 < 30) return;
+    const basin = { Atlantic:'ATLÁNTICO', Pacific:'PACÍFICO', 'Central Pacific':'PACÍFICO CENTRAL' }[p.basin] || String(p.basin || '').toUpperCase();
+    items.push({
+      cve: null,
+      tone: p7 >= 60 ? 'red' : 'yellow',
+      icon: '🌀',
+      loc: 'POSIBLE FORMACIÓN · '+basin,
+      detail: (p.prob2day || '—')+' a 2 días · '+(p.prob7day || '—')+' a 7 días · NHC'
+    });
+  });
   // ─── Sismos M5+ últimos 7 días (USGS) ────────────────────────────────
   if(riskFeeds.quakes && riskFeeds.quakes.features){
     riskFeeds.quakes.features.filter(f => (f.properties.mag||0) >= 5).slice(0, 5).forEach(f => {
@@ -5235,6 +5295,9 @@ try {
     map.addSource('hurr-cone',   { type:'geojson', data: hurricanesFC('cone') });
     map.addSource('hurr-track',  { type:'geojson', data: hurricanesFC('track') });
     map.addSource('hurr-points', { type:'geojson', data: hurricanesFC('points') });
+    map.addSource('hurr-ww',     { type:'geojson', data: hurricanesFC('ww') });
+    map.addSource('hurr-outlook',     { type:'geojson', data: outlookFC('areas') });
+    map.addSource('hurr-outlook-pts', { type:'geojson', data: outlookFC('points') });
     map.addSource('quakes',      { type:'geojson', data: quakesFC() });
     map.addSource('sites',       { type:'geojson', data: sitesFC() });
     map.addSource('geocercas',   { type:'geojson', data: geocercasFC() });
@@ -5379,6 +5442,36 @@ try {
     }, firstSymbolLayer);
 
     // ── Capas de riesgo externo (solo modo clima) ─────────────────────────
+    // Áreas de posible formación (Tropical Weather Outlook del NHC, 7 días): el
+    // color sigue el riesgo a 7 días (Low / Medium / High) y la etiqueta dice las
+    // probabilidades a 2 y 7 días. Pedido de PepsiCo: ver la «zona de vigilancia»
+    // desde que un ciclón se está formando, no solo los activos.
+    const OUTLOOK_COLOR = ['match', ['coalesce', ['get','risk7day'], ''], 'High', '#c81f10', 'Medium', '#ff9530', '#e4c249'];
+    map.addLayer({
+      id: 'hurr-outlook-fill', type: 'fill', source: 'hurr-outlook',
+      layout: { visibility: 'none' },
+      paint: { 'fill-color': OUTLOOK_COLOR, 'fill-opacity': 0.14 }
+    }, firstSymbolLayer);
+    map.addLayer({
+      id: 'hurr-outlook-line', type: 'line', source: 'hurr-outlook',
+      layout: { visibility: 'none' },
+      paint: { 'line-color': OUTLOOK_COLOR, 'line-width': 1.6, 'line-opacity': 0.9, 'line-dasharray': [1.5,1.5] }
+    }, firstSymbolLayer);
+    // Avisos costeros vigentes del NHC sobre la costa: aviso (warning) en línea
+    // sólida, vigilancia (watch) punteada; rojo huracán, naranja tormenta tropical.
+    const WW_COLOR = ['match', ['coalesce', ['get','tcww'], ''], 'HWR', '#c81f10', 'HWA', '#c81f10', 'TWR', '#ff9530', 'TWA', '#ff9530', '#c81f10'];
+    map.addLayer({
+      id: 'hurr-ww-warning', type: 'line', source: 'hurr-ww',
+      filter: ['in', ['coalesce', ['get','tcww'], ''], ['literal', ['HWR','TWR']]],
+      layout: { visibility: 'none', 'line-cap':'round', 'line-join':'round' },
+      paint: { 'line-color': WW_COLOR, 'line-width': 5, 'line-opacity': 0.9 }
+    }, firstSymbolLayer);
+    map.addLayer({
+      id: 'hurr-ww-watch', type: 'line', source: 'hurr-ww',
+      filter: ['in', ['coalesce', ['get','tcww'], ''], ['literal', ['HWA','TWA']]],
+      layout: { visibility: 'none', 'line-cap':'butt', 'line-join':'round' },
+      paint: { 'line-color': WW_COLOR, 'line-width': 5, 'line-opacity': 0.9, 'line-dasharray': [1.2,1.2] }
+    }, firstSymbolLayer);
     // Cono de incertidumbre NHC: relleno tenue + borde, debajo de labels.
     map.addLayer({
       id: 'hurr-cone-fill', type: 'fill', source: 'hurr-cone',
@@ -5414,21 +5507,63 @@ try {
       id: 'hurr-points-label', type: 'symbol', source: 'hurr-points',
       layout: {
         visibility: 'none',
-        'text-field': ['case', ['==', ['get','tau'], 0],
-          ['get','stormname'],
-          ['get','datelbl']
+        // Categoría fija en cada punto (pedido de PepsiCo, 19-oct): «H1»…«H5» por
+        // ssnum (Saffir-Simpson), «TT» tormenta (sub)tropical, «DT» depresión
+        // (sub)tropical, «PT» post-tropical — los mismos campos que ya usa el
+        // tooltip. En tau=0 va junto al nombre; en los demás puntos, antes del
+        // día/hora. Sin categoría conocida, la etiqueta queda como antes.
+        'text-field': ['let', 'cat',
+          ['case',
+            ['>=', ['coalesce', ['get','ssnum'], 0], 1],
+              ['concat', 'H', ['to-string', ['to-number', ['get','ssnum']]]],
+            ['in', ['coalesce', ['get','stormtype'], ''], ['literal', ['TS','STS']]], 'TT',
+            ['in', ['coalesce', ['get','stormtype'], ''], ['literal', ['TD','STD']]], 'DT',
+            ['==', ['coalesce', ['get','stormtype'], ''], 'PTC'], 'PT',
+            ''
+          ],
+          ['case', ['==', ['get','tau'], 0],
+            ['concat', ['coalesce', ['get','stormname'], ''],
+              ['case', ['==', ['var','cat'], ''], '', ['concat', ' · ', ['var','cat']]]],
+            ['concat', ['var','cat'],
+              ['case', ['==', ['var','cat'], ''], '', ' · '],
+              ['coalesce', ['get','datelbl'], '']]
+          ]
         ],
         'text-font': ['Open Sans Semibold', 'Arial Unicode MS Bold'],
-        'text-size': ['case', ['==', ['get','tau'], 0], 12, 9],
-        'text-offset': [0, 1.3],
-        'text-anchor': 'top',
-        'text-allow-overlap': false
+        'text-size': ['case', ['==', ['get','tau'], 0], 12, 10],
+        // El nombre (tau=0) va ARRIBA del punto y las horas abajo: así el nombre
+        // no se encima con la etiqueta del siguiente punto de la trayectoria.
+        'text-offset': ['case', ['==', ['get','tau'], 0], ['literal', [0, -1.3]], ['literal', [0, 1.3]]],
+        'text-anchor': ['case', ['==', ['get','tau'], 0], 'bottom', 'top'],
+        // Fija de verdad: Mapbox oculta las etiquetas que chocan; con overlap la
+        // categoría se ve en todos los puntos aunque en zoom bajo se encimen.
+        'text-allow-overlap': true
       },
       paint: {
         'text-color': '#c81f10',
         'text-halo-color': 'rgba(255,255,255,0.95)',
         'text-halo-width': 2
       }
+    });
+    // Posición actual de cada área de formación (la «X» del NHC) con su etiqueta.
+    map.addLayer({
+      id: 'hurr-outlook-point', type: 'circle', source: 'hurr-outlook-pts',
+      layout: { visibility: 'none' },
+      paint: { 'circle-radius': 5.5, 'circle-color': OUTLOOK_COLOR, 'circle-opacity': 0.95, 'circle-stroke-color': '#fff', 'circle-stroke-width': 1.4 }
+    });
+    map.addLayer({
+      id: 'hurr-outlook-label', type: 'symbol', source: 'hurr-outlook-pts',
+      layout: {
+        visibility: 'none',
+        'text-field': ['concat', 'Posible formación\n', ['coalesce', ['get','prob2day'], '—'], ' a 2 días · ', ['coalesce', ['get','prob7day'], '—'], ' a 7 días'],
+        'text-font': ['Open Sans Semibold', 'Arial Unicode MS Bold'],
+        'text-size': 10,
+        'text-max-width': 16,
+        'text-offset': [0, 1.2],
+        'text-anchor': 'top',
+        'text-allow-overlap': true
+      },
+      paint: { 'text-color': '#7a4a00', 'text-halo-color': 'rgba(255,255,255,0.95)', 'text-halo-width': 2 }
     });
     // Sismos USGS M4.5+ últimos 7 días — radio por magnitud.
     map.addLayer({
@@ -5562,6 +5697,29 @@ try {
       hoverPopup.setLngLat(e.lngLat).setHTML(html).addTo(map);
     });
     map.on('mouseleave', 'hurr-points-circle', hoverOut);
+    const WW_ES = { HWR:'Aviso de huracán', HWA:'Vigilancia de huracán', TWR:'Aviso de tormenta tropical', TWA:'Vigilancia de tormenta tropical' };
+    ['hurr-ww-warning','hurr-ww-watch'].forEach(id => {
+      map.on('mouseenter', id, (e) => {
+        map.getCanvas().style.cursor = 'pointer';
+        const p = e.features[0].properties || {};
+        const html = '<div class="tn">'+escHTML(p._name || p.stormname || 'Ciclón')+'</div>'
+          + '<div class="tl" style="color:#c81f10">'+(WW_ES[p.tcww] || 'Aviso costero').toUpperCase()+'</div>'
+          + '<div class="ti">Costa bajo '+(String(p.tcww||'').endsWith('A') ? 'vigilancia' : 'aviso')+' · aviso #'+escHTML(p.advisnum || '')+' NHC</div>';
+        hoverPopup.setLngLat(e.lngLat).setHTML(html).addTo(map);
+      });
+      map.on('mouseleave', id, hoverOut);
+    });
+    const BASIN_ES = { Atlantic:'Atlántico', Pacific:'Pacífico', 'Central Pacific':'Pacífico central' };
+    const RISK_ES = { Low:'riesgo bajo', Medium:'riesgo medio', High:'riesgo alto' };
+    map.on('mouseenter', 'hurr-outlook-fill', (e) => {
+      map.getCanvas().style.cursor = 'pointer';
+      const p = e.features[0].properties || {};
+      const html = '<div class="tn">Posible formación · '+(BASIN_ES[p.basin] || escHTML(p.basin || ''))+'</div>'
+        + '<div class="tl" style="color:#c81f10">'+escHTML(p.prob2day || '—')+' A 2 DÍAS · '+escHTML(p.prob7day || '—')+' A 7 DÍAS</div>'
+        + '<div class="ti">'+(RISK_ES[p.risk7day] || '')+' a 7 días · Tropical Weather Outlook, NHC</div>';
+      hoverPopup.setLngLat(e.lngLat).setHTML(html).addTo(map);
+    });
+    map.on('mouseleave', 'hurr-outlook-fill', hoverOut);
     map.on('mouseenter', 'quakes-circle', (e) => {
       map.getCanvas().style.cursor = 'pointer';
       const p = e.features[0].properties;
